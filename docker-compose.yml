@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  # 1. LA BÓVEDA (PostgreSQL + pgvector)
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: ayni_db
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ayni_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?⚠️ Define POSTGRES_PASSWORD en tu .env}
+      POSTGRES_DB: ${POSTGRES_DB:-aynipoint_local}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ayni_admin -d aynipoint_local" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 2. CAPA 3: API CORE (FastAPI - Python 3.13)
+  api-core:
+    container_name: ayni_api_core
+    build:
+      context: . # <--- EL CONTEXTO ES LA RAÍZ DEL MONOREPO
+      dockerfile: infra/docker/api.Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      # Montamos todo el monorepo para que lea 'apps/api-core' y 'packages/db'
+      - .:/code
+    working_dir: /code/apps/api-core # Nos ubicamos en la carpeta de la API
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # 3. CAPA 1: WEB B2B (Next.js - Portal Comercio)
+  web-b2b:
+    container_name: ayni_web_b2b
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/code
+      - /code/node_modules # Protege los módulos de Node del host local
+    working_dir: /code/apps/web-b2b # Nos ubicamos en el portal B2B
+    command: npm run dev
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - api-core
+
+  # 4. CAPA 1: WEB B2C (Next.js - Billetera Cliente)
+  web-b2c:
+    container_name: ayni_web_b2c
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+    ports:
+      - "3001:3000" # Mapeado al puerto 3001 para no chocar con B2B
+    volumes:
+      - .:/code
+      - /code/node_modules
+    working_dir: /code/apps/web-b2c # Nos ubicamos en la billetera
+    command: npm run dev
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - api-core
+
+volumes:
+  postgres_data:

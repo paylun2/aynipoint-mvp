@@ -1,0 +1,16 @@
+# Exclusiones globales del Monorepo
+.git
+node_modules/
+apps/*/node_modules/
+packages/*/node_modules/
+.next/
+apps/*/.next/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secretos
+.env
+.env.local

@@ -1,0 +1,4 @@
+-- AGREGAR COLUMNA DE TEMA A LA ORGANIZACIÓN
+-- Opciones esperadas: 'LIGHT', 'DARK', 'NEON'
+ALTER TABLE public.organizations 
+ADD COLUMN IF NOT EXISTS ui_theme VARCHAR(50) DEFAULT 'DARK';

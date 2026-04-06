@@ -5,14 +5,37 @@ import { Ratelimit } from '@upstash/ratelimit'
 const getRedisClient = () => {
     try {
         if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
-            console.warn('⚠️ UPSTASH_REDIS_REST_URL o UPSTASH_REDIS_REST_TOKEN no están definidos. Redis funcionará en modo MOCK (Simulación) para evitar crasheos.');
+            console.warn('⚠️ UPSTASH_REDIS_REST_URL o UPSTASH_REDIS_REST_TOKEN no están definidos. Redis funcionará en modo MEMORIA GLOBAL (Dev).');
             
-            // Mock object for local dev without Upstash
+            // In Next.js dev, use globalThis to persist state across API Hot-Reloads
+            const globalAny = globalThis as any;
+            if (!globalAny._redisMockStore) {
+                globalAny._redisMockStore = new Map<string, any>();
+            }
+            const mockStore = globalAny._redisMockStore;
+
             return {
-                get: async () => null,
-                set: async () => 'OK',
-                setex: async () => 'OK',
-                del: async () => 1,
+                get: async (key: string) => {
+                    const val = mockStore.has(key) ? mockStore.get(key) : null;
+                    console.log(`[MOCK REDIS GET] ${key} -> ${val}`);
+                    return val;
+                },
+                set: async (key: string, value: any) => { 
+                    mockStore.set(key, value); 
+                    console.log(`[MOCK REDIS SET] ${key} -> ${value}`);
+                    return 'OK'; 
+                },
+                setex: async (key: string, ttl: number, value: any) => {
+                    mockStore.set(key, value); 
+                    console.log(`[MOCK REDIS SETEX] ${key} -> ${value} (TTL ${ttl}s)`);
+                    setTimeout(() => mockStore.delete(key), ttl * 1000);
+                    return 'OK'; 
+                },
+                del: async (key: string) => { 
+                    mockStore.delete(key); 
+                    console.log(`[MOCK REDIS DEL] ${key}`);
+                    return 1; 
+                },
             } as unknown as Redis;
         }
 
@@ -44,6 +67,15 @@ export const rateLimitPos = isRedisActive
         limiter: Ratelimit.slidingWindow(5, '10 s'),
         analytics: true,
         prefix: '@upstash/ratelimit/pos',
+    }) : null;
+
+/** POS: PIN Validation Anti-BruteForce (3 attempts / 5 mins per org+user) */
+export const rateLimitPosPin = isRedisActive
+    ? new Ratelimit({
+        redis: redis as Redis,
+        limiter: Ratelimit.slidingWindow(3, '5 m'),
+        analytics: true,
+        prefix: '@upstash/ratelimit/pos-pin',
     }) : null;
 
 /** Validación de teléfono: 5 intentos cada 60 segundos por número (anti-ghost-spam) */

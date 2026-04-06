@@ -2,15 +2,16 @@
 import React, { useState, useRef, useCallback } from 'react';
 import Numpad from '@/components/pos/Numpad';
 import POSTabs from '@/components/pos/POSTabs';
-import { Smartphone, Banknote, ShieldCheck, PlusCircle, Loader2, AlertTriangle, Gift, Lock, Crown, Rocket, WifiOff } from 'lucide-react';
+import { Smartphone, Banknote, ShieldCheck, PlusCircle, Loader2, AlertTriangle, Gift, Lock, Crown, Rocket, WifiOff, QrCode } from 'lucide-react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
-import { processPosTransaction } from '@/app/actions/pos';
+import { processPosTransaction, validateSecurityToken } from '@/app/actions/pos';
 import { getOrganizationBySlug } from '@/app/actions/org';
 import { getDiscounts } from '@/app/actions/discounts';
 import B2BTopNav from '@/components/b2b/B2BTopNav';
 import { getDashboardMetrics } from '@/app/actions/dashboard';
 import { useOnlineStatus } from '@/hooks/useOnlineStatus';
+import QRScanner from '@/components/b2b/QRScanner';
 
 // ═══════ AUDIO FEEDBACK (Web Audio API — sin dependencias externas) ═══════
 function playPosSound(type: 'success' | 'error') {
@@ -64,13 +65,18 @@ export default function POSPage() {
     const [ghostCount, setGhostCount] = useState(0);
     const [planTier, setPlanTier] = useState('FREE');
 
+    // 📷 FASE 9: QR Scanner State
+    const [showQRScanner, setShowQRScanner] = useState(false);
+
     const tokenRefs = [
         useRef<HTMLInputElement>(null),
         useRef<HTMLInputElement>(null),
         useRef<HTMLInputElement>(null),
         useRef<HTMLInputElement>(null),
+        useRef<HTMLInputElement>(null),
+        useRef<HTMLInputElement>(null),
     ];
-    const [tokenValues, setTokenValues] = useState(['', '', '', '']);
+    const [tokenValues, setTokenValues] = useState(['', '', '', '', '', '']);
 
     React.useEffect(() => {
         const fetchOrgAndUser = async () => {
@@ -123,7 +129,7 @@ export default function POSPage() {
         setAmount('');
         setFeedback(null);
         setSelectedReward(null);
-        setTokenValues(['', '', '', '']);
+        setTokenValues(['', '', '', '', '', '']); // 6 Digitos
     }, [activeTab]);
 
     const handleTokenInput = (index: number, value: string) => {
@@ -132,7 +138,7 @@ export default function POSPage() {
         newTokens[index] = char;
         setTokenValues(newTokens);
 
-        if (char && index < 3) {
+        if (char && index < 5) {
             tokenRefs[index + 1].current?.focus();
         }
     };
@@ -144,6 +150,46 @@ export default function POSPage() {
     };
 
     const fullToken = tokenValues.join('');
+
+    const handleQRScan = (payload: string) => {
+        try {
+            // Expected Format: AYNI|orgSlug|rewardId|token
+            const parts = payload.split('|');
+            if (parts.length === 4 && parts[0] === 'AYNI') {
+                const scannedOrg = parts[1];
+                const scannedRewardId = parts[2];
+                const scannedToken = parts[3];
+
+                if (scannedOrg !== params?.slug) {
+                    setFeedback({ type: 'error', message: 'Token pertenece a otra sucursal.' });
+                    playPosSound('error');
+                    setShowQRScanner(false);
+                    return;
+                }
+
+                if (scannedRewardId !== 'none') {
+                    const matchReward = rewards.find(r => r.id === scannedRewardId);
+                    if (matchReward) {
+                        setSelectedReward(matchReward);
+                    }
+                }
+
+                // Autocompletar PIN
+                const tokens = scannedToken.padEnd(6, '').split('').slice(0, 6);
+                setTokenValues(tokens);
+
+                setShowQRScanner(false);
+                setFeedback({ type: 'success', message: 'Token escaneado correctamente. Revisa el canje.' });
+                playPosSound('success');
+            } else {
+                setFeedback({ type: 'error', message: 'Código QR no reconocido o formato inválido.' });
+                playPosSound('error');
+                setShowQRScanner(false);
+            }
+        } catch (e) {
+            console.error("Error parsing QR", e);
+        }
+    };
 
     const handleTransaction = async () => {
         if (!phone || (activeTab === 'emitir' && !amount)) return;
@@ -170,8 +216,8 @@ export default function POSPage() {
 
         // processPosTransaction: orgSlug, phone, points, type, securityToken, rewardId, rewardTitle
         const result = await processPosTransaction(
-            slug, 
-            phone, 
+            slug,
+            phone,
             pointsToProcess,
             activeTab === 'emitir' ? 'EARN' : 'REDEEM',
             activeTab === 'canjear' ? fullToken : undefined,
@@ -180,7 +226,7 @@ export default function POSPage() {
         );
 
         if (result.success) {
-            const msg = activeTab === 'emitir' 
+            const msg = activeTab === 'emitir'
                 ? `¡Exitoso! Nuevo saldo del cliente: ${result.data?.newBalance} pts`
                 : `¡Canje exitoso! "${selectedReward?.discount_percentage}% DSCTO" procesado. Saldo restante: ${result.data?.newBalance} pts`;
             setFeedback({ type: 'success', message: msg });
@@ -188,7 +234,7 @@ export default function POSPage() {
             setAmount('');
             setPhone('');
             setSelectedReward(null);
-            setTokenValues(['', '', '', '']);
+            setTokenValues(['', '', '', '', '', '']);
         } else {
             // 🔒 FASE 6: Detect Kill-Switch from server
             if ((result as any).killSwitch) {
@@ -201,7 +247,39 @@ export default function POSPage() {
         setIsLoading(false);
     };
 
-    const canSubmitCanjear = phone && selectedReward && fullToken.length === 4;
+    React.useEffect(() => {
+        if (activeTab === 'canjear' && fullToken.length === 6 && phone && phone.length >= 9 && !isLoading) {
+            handleValidateToken();
+        }
+    }, [fullToken, phone, activeTab]);
+
+    const handleValidateToken = async () => {
+        if (!phone || fullToken.length !== 6) return;
+        setIsLoading(true);
+        setFeedback(null);
+        const slug = typeof params?.slug === 'string' ? params.slug : '';
+        if (!slug) { setIsLoading(false); return; }
+
+        const res = await validateSecurityToken(slug, phone, fullToken);
+        if (res.success && res.rewardId) {
+            const matchReward = rewards.find(r => r.id === res.rewardId);
+            if (matchReward) {
+                setSelectedReward(matchReward);
+                setFeedback({ type: 'success', message: '¡Token Válido! Por favor verifica el premio y procede a "Confirmar Canje".' });
+                playPosSound('success');
+            } else {
+                setFeedback({ type: 'error', message: 'Premio no encontrado en el catálogo.' });
+                playPosSound('error');
+            }
+        } else {
+            setFeedback({ type: 'error', message: res.error || 'Token inválido' });
+            playPosSound('error');
+        }
+        setIsLoading(false);
+    };
+
+    const canSubmitCanjear = phone && selectedReward && fullToken.length === 6;
+    const canValidateToken = phone && !selectedReward && fullToken.length === 6;
 
     return (
         <div className="flex-1 flex flex-col w-full h-full min-h-screen relative bg-[#0F172A] pb-20 font-sans text-slate-100">
@@ -221,7 +299,7 @@ export default function POSPage() {
                         </p>
                         <div className="bg-[#1E293B] rounded-xl p-4 border border-[#334155] mb-6">
                             <p className="text-sm text-slate-300 leading-relaxed">
-                                Por seguridad bancaria, el terminal requiere conexión a internet para procesar puntos. 
+                                Por seguridad bancaria, el terminal requiere conexión a internet para procesar puntos.
                                 Todas las transacciones deben ser validadas en tiempo real contra el servidor central.
                             </p>
                         </div>
@@ -339,16 +417,18 @@ export default function POSPage() {
                                                 <p className="text-amber-500/70 text-xs mt-1">Ve a la sección "Premios" para crear catálogo.</p>
                                             </div>
                                         ) : (
-                                            <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+                                            <div
+                                                className="space-y-2 max-h-48 overflow-y-auto pr-1"
+                                                style={fullToken.length >= 6 ? { pointerEvents: 'none', opacity: 0.6 } : {}}
+                                            >
                                                 {rewards.map((reward) => (
                                                     <button
                                                         key={reward.id}
                                                         onClick={() => setSelectedReward(reward)}
-                                                        className={`w-full text-left p-3.5 rounded-xl border-2 transition-all ${
-                                                            selectedReward?.id === reward.id
+                                                        className={`w-full text-left p-3.5 rounded-xl border-2 transition-all ${selectedReward?.id === reward.id
                                                                 ? 'border-[#f69f09] bg-[#f69f09]/10'
                                                                 : 'border-[#334155] hover:border-slate-600 bg-[#0F172A]'
-                                                        }`}
+                                                            }`}
                                                     >
                                                         <div className="flex items-center justify-between gap-2">
                                                             <div className="flex-1 min-w-0">
@@ -359,11 +439,10 @@ export default function POSPage() {
                                                                     {reward.description}
                                                                 </p>
                                                             </div>
-                                                            <span className={`font-mono font-bold text-sm shrink-0 px-2 py-1 rounded-lg ${
-                                                                selectedReward?.id === reward.id
+                                                            <span className={`font-mono font-bold text-sm shrink-0 px-2 py-1 rounded-lg ${selectedReward?.id === reward.id
                                                                     ? 'bg-[#f69f09] text-navy-900'
                                                                     : 'bg-[#1E293B] text-slate-300'
-                                                            }`}>
+                                                                }`}>
                                                                 {reward.points_cost} pts
                                                             </span>
                                                         </div>
@@ -383,13 +462,21 @@ export default function POSPage() {
                                         </div>
                                     )}
 
-                                    {/* Token Input */}
-                                    <div>
-                                        <label className="text-slate-400 text-[10px] font-bold uppercase tracking-widest mb-3 flex items-center justify-center gap-2">
-                                            <ShieldCheck className="w-3.5 h-3.5" /> Token de Cliente
-                                        </label>
-                                        <div className="flex justify-center gap-2 sm:gap-3">
-                                            {[0, 1, 2, 3].map((i) => (
+                                    {/* Token Input or QR */}
+                                    <div className="flex flex-col items-center">
+                                        <div className="flex items-center justify-between w-full mb-3 px-2">
+                                            <label className="text-slate-400 text-[10px] font-bold uppercase tracking-widest flex items-center gap-2">
+                                                <ShieldCheck className="w-3.5 h-3.5" /> Token de Cliente
+                                            </label>
+                                            <button
+                                                onClick={() => setShowQRScanner(true)}
+                                                className="text-sky-400 hover:text-sky-300 bg-sky-500/10 hover:bg-sky-500/20 text-[10px] uppercase font-bold tracking-widest px-3 py-1.5 rounded-full flex items-center gap-1.5 transition-colors"
+                                            >
+                                                <QrCode className="w-3.5 h-3.5" /> Escanear QR
+                                            </button>
+                                        </div>
+                                        <div className="flex justify-center gap-1.5 sm:gap-2 w-full">
+                                            {[0, 1, 2, 3, 4, 5].map((i) => (
                                                 <input
                                                     key={i}
                                                     ref={tokenRefs[i]}
@@ -398,7 +485,7 @@ export default function POSPage() {
                                                     value={tokenValues[i]}
                                                     onChange={(e) => handleTokenInput(i, e.target.value)}
                                                     onKeyDown={(e) => handleTokenKeyDown(i, e)}
-                                                    className="w-14 h-16 sm:w-16 sm:h-20 text-center bg-[#0F172A] border-2 border-[#334155] focus:border-[#f69f09] outline-none rounded-xl uppercase text-4xl font-mono font-bold text-white transition-all placeholder:text-[#334155] shadow-inner"
+                                                    className="w-10 h-14 sm:w-12 sm:h-16 text-center bg-[#0F172A] border-2 border-[#334155] focus:border-[#f69f09] outline-none rounded-xl uppercase text-2xl sm:text-3xl font-mono font-bold text-white transition-all placeholder:text-[#334155] shadow-inner"
                                                     placeholder="•"
                                                 />
                                             ))}
@@ -411,32 +498,36 @@ export default function POSPage() {
                         {/* Submit Button + Feedback */}
                         <div className="mt-8 flex flex-col items-center">
                             <button
-                                onClick={handleTransaction}
+                                onClick={activeTab === 'canjear' && canValidateToken ? handleValidateToken : handleTransaction}
                                 disabled={
-                                    isLoading || 
-                                    !phone || 
-                                    (activeTab === 'emitir' && !amount) || 
-                                    (activeTab === 'canjear' && !canSubmitCanjear)
+                                    isLoading ||
+                                    !phone ||
+                                    (activeTab === 'emitir' && !amount) ||
+                                    (activeTab === 'canjear' && !canSubmitCanjear && !canValidateToken)
                                 }
-                                className={`w-full font-black py-4 rounded-xl flex items-center justify-center gap-3 transition-colors disabled:opacity-50 ${
-                                    activeTab === 'emitir' 
-                                        ? 'bg-[#f69f09] hover:bg-[#d98b08] text-[#0F172A]' 
-                                        : 'bg-emerald-500 hover:bg-emerald-600 text-[#0F172A]'
-                                }`}>
+                                className={`w-full font-black py-4 rounded-xl flex items-center justify-center gap-3 transition-colors disabled:opacity-50 ${activeTab === 'emitir'
+                                        ? 'bg-[#f69f09] hover:bg-[#d98b08] text-[#0F172A]'
+                                        : canValidateToken
+                                            ? 'bg-sky-500 hover:bg-sky-600 text-[#0F172A]'
+                                            : 'bg-emerald-500 hover:bg-emerald-600 text-[#0F172A]'
+                                    }`}>
                                 <span>
                                     {isLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : <PlusCircle className="w-5 h-5" />}
                                 </span>
                                 <span className="text-lg uppercase tracking-widest">
-                                    {isLoading ? 'Procesando...' : (activeTab === 'emitir' ? 'Emitir Puntos' : 'Confirmar Canje')}
+                                    {isLoading
+                                        ? 'Procesando...'
+                                        : activeTab === 'emitir'
+                                            ? 'Emitir Puntos'
+                                            : (canValidateToken ? 'Consultar Código' : 'Confirmar Canje')}
                                 </span>
                             </button>
 
                             {feedback && (
-                                <div className={`p-4 rounded-xl w-full text-center font-bold text-sm mt-4 border ${
-                                    feedback.type === 'success' 
-                                        ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' 
+                                <div className={`p-4 rounded-xl w-full text-center font-bold text-sm mt-4 border ${feedback.type === 'success'
+                                        ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
                                         : 'bg-red-500/10 text-red-400 border-red-500/20'
-                                }`}>
+                                    }`}>
                                     {feedback.message}
                                 </div>
                             )}
@@ -449,6 +540,14 @@ export default function POSPage() {
                     <Numpad onKeyPress={handleNumpadPress} onBackspace={handleBackspace} />
                 </div>
             </main>
+
+            {/* FASE 9: QR Scanner Modal */}
+            {showQRScanner && (
+                <QRScanner
+                    onScan={handleQRScan}
+                    onClose={() => setShowQRScanner(false)}
+                />
+            )}
         </div>
     );
 }

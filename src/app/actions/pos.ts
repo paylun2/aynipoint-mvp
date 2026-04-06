@@ -4,7 +4,7 @@ import { createClient } from '@/utils/supabase/server'
 import { revalidatePath } from 'next/cache'
 import { headers } from 'next/headers'
 import { cleanPhoneNumber, validatePhoneFormat, getPhoneFormatErrorMessage } from '@/lib/phone-validation'
-import { rateLimitPos, redis } from '@/lib/redis'
+import { rateLimitPos, redis, rateLimitPosPin } from '@/lib/redis'
 import { logSecurityEvent } from '@/lib/logger'
 import { sanitizeError } from '@/lib/error-sanitizer'
 
@@ -123,6 +123,69 @@ export async function processPosTransaction(
             return {
                 success: false,
                 error: getPhoneFormatErrorMessage(countryRule)
+            }
+        }
+
+        // 1.3 🔒 Validate Security PIN (REDIS TOTP) for Redemptions
+        if (type === 'REDEEM') {
+            if (!securityToken || securityToken.trim().length === 0) {
+                return { success: false, error: 'Se requiere el PIN de Seguridad del cliente para canjear premios.' }
+            }
+            if (!rewardId) {
+                return { success: false, error: 'Se requiere especificar el premio para procesar un canje seguro.' }             
+            }
+
+            // [NUEVO] Rate Limiting estricto anti-fuerza bruta para PINs
+            if (rateLimitPosPin) {
+                const reqHeaders = await headers();
+                const ip = reqHeaders.get('x-forwarded-for') ?? '127.0.0.1';
+                const pinIdentifier = `org:${orgSlug}:cajero:${user.id}:${ip}`;
+                const { success } = await rateLimitPosPin.limit(pinIdentifier);
+                if (!success) {
+                    await logSecurityEvent({
+                        eventType: 'RATE_LIMIT_EXCEEDED',
+                        severity: 'CRITICAL',
+                        actorUserId: user.id,
+                        targetId: orgSlug,
+                        ipAddress: ip,
+                        metadata: { type: 'BRUTE_FORCE_PIN_ATTEMPT', endpoint: '/api/pos' }
+                    });
+                    return { success: false, error: '🛡️ BLOQUEO DE SEGURIDAD: Múltiples intentos fallidos de PIN. Terminal suspendida temporalmente para evitar fuerza bruta.' }
+                }
+            }
+
+            if (!redis) {
+                console.warn('CRITICAL: Redis is not configured. Bypass security token check.')
+            } else {
+                // Usar numericPhone garantiza que el formato empata con el guardado por el usuario en BD
+                const numericPhoneForRedis = cleanedPhone.replace(/\D/g, '');
+                const tokenKey = `b2b_token:${orgId}:${numericPhoneForRedis}`;
+                const redisData = await redis.get<string | object>(tokenKey);
+                
+                let payload: any = null;
+                if (typeof redisData === 'string') {
+                    try { payload = JSON.parse(redisData); } catch(e) { payload = redisData; }
+                } else {
+                    payload = redisData;
+                }
+
+                const isValidToken = payload && typeof payload === 'object' 
+                    ? (payload.code?.toUpperCase() === securityToken.toUpperCase().trim() && payload.rewardId === rewardId)
+                    : false; // Fallback bloqueado para tickets antiguos
+
+                if (!isValidToken) {
+                    await logSecurityEvent({
+                        eventType: 'DANGEROUS_ACTION',
+                        severity: 'WARN',
+                        actorUserId: user.id,
+                        targetId: orgSlug,
+                        metadata: { type: 'INVALID_TOTP_PIN', phone: cleanedPhone }
+                    });
+                    return { success: false, error: 'El PIN de Seguridad es incorrecto, expiró, o no corresponde a esta recompensa.' }
+                }
+                
+                // Consumir el token tras su uso para evitar robo por repetición (Replay Attacks)
+                await redis.del(tokenKey)
             }
         }
 
@@ -311,6 +374,25 @@ export async function processPosTransaction(
             }
         }
 
+        // 4.5 🔒 ZERO-TRUST: Override of Frontend points for REDEEM
+        let trueRewardTitle = rewardTitle;
+        if (type === 'REDEEM' && rewardId) {
+            const { data: dbReward } = await supabase
+                .from('b2b_discounts')
+                .select('points_cost, discount_percentage')
+                .eq('id', rewardId)
+                .single();
+                
+            if (!dbReward) {
+                return { success: false, error: 'Recompensa detectada como inactiva o eliminada. Canje abortado por seguridad.' };
+            }
+            
+            // Override Absolute Backend Truth (Ignorar Frontend tampering)
+            finalPointsAmount = dbReward.points_cost;
+            pointsToProcess = finalPointsAmount; // just for logging consistency
+            trueRewardTitle = `${dbReward.discount_percentage}% DSCTO`;
+        }
+
         // Para REDEEM: Validate balance
         if (type === 'REDEEM' && balance < finalPointsAmount) {
             return { success: false, error: `Saldo insuficiente. El cliente tiene ${balance} pts y necesita ${finalPointsAmount} pts.` }
@@ -318,29 +400,29 @@ export async function processPosTransaction(
 
         // 5. Insert into ledger — RLS: "Auth: Cajeros crean transacciones" (006)
         const transactionAmount = type === 'EARN' ? finalPointsAmount : -finalPointsAmount
-        const newBalance = balance + transactionAmount
 
-        const { error: txError } = await supabase
+        const { data: newTx, error: txError } = await supabase
             .from('ledger_transactions')
             .insert([{
                 wallet_id: walletId,
                 org_id: orgId,
                 type: type,
                 amount: transactionAmount,
-                balance_snapshot: newBalance,
+                // Proveemos 0 como dummy para sortear el constraint NOT NULL (El trigger de PG lo sobrescribirá)
+                balance_snapshot: 0,
                 created_by_member_id: membership.id,
-                description: type === 'REDEEM' && rewardTitle 
-                    ? `Canje: ${rewardTitle}` 
+                description: type === 'REDEEM' && trueRewardTitle 
+                    ? `Canje: ${trueRewardTitle}` 
                     : `Transacción desde POS (Terminal)`,
                 // Transparencia Financiera: Registrar multiplicador aplicado
-                // Solo se graba cuando hay multiplicador > 1.0 (días de promoción)
-                // Transacciones normales (x1) mantienen metadata vacía
                 metadata: appliedMultiplier > 1.0 ? {
                     base_amount: pointsToProcess,
                     multiplier: appliedMultiplier,
                     multiplier_day: new Date().toLocaleDateString('es-PE', { weekday: 'long' })
                 } : {}
             }])
+            .select('balance_snapshot')
+            .single()
 
         if (txError) {
             console.debug('[POS] TX Error:', txError);
@@ -354,7 +436,8 @@ export async function processPosTransaction(
         return {
             success: true,
             data: {
-                newBalance: newBalance,
+                // Recuperar la verdad atómica calculada por el trigger de Postgres
+                newBalance: newTx?.balance_snapshot ?? (balance + transactionAmount),
                 walletId,
                 pointsGenerated: pointsGenerated 
             }
@@ -363,5 +446,40 @@ export async function processPosTransaction(
     } catch (err: any) {
         console.error('POS Action Error:', err)
         return { success: false, error: sanitizeError(err, 'pos') }
+    }
+}
+
+export async function validateSecurityToken(orgSlug: string, phone: string, tokenToValidate: string) {
+    const supabase = await createClient();
+    try {
+        const { data: { user }, error: authError } = await supabase.auth.getUser()
+        if (authError || !user) throw new Error('No autorizado')
+
+        const { data: orgData } = await supabase.from('organizations').select('id').eq('slug', orgSlug).single();
+        if (!orgData) return { success: false, error: 'Negocio no encontrado.' };
+
+        const cleanedPhone = cleanPhoneNumber(phone);
+        const numericPhoneForRedis = cleanedPhone.replace(/\D/g, '');
+        const expectedKey = `b2b_token:${orgData.id}:${numericPhoneForRedis}`;
+
+        if (!redis) return { success: false, error: 'No Redis server.' };
+
+        const dataStr = await redis.get<string | object>(expectedKey);
+        if (!dataStr) return { success: false, error: 'Token inválido o expirado' };
+
+        let payload: any;
+        if (typeof dataStr === 'string') {
+             try { payload = JSON.parse(dataStr); } catch { return { success: false, error: 'Formato de token inválido' } }
+        } else {
+             payload = dataStr;
+        }
+
+        if (payload?.code?.toUpperCase() !== tokenToValidate.toUpperCase()) {
+            return { success: false, error: 'Código incorrecto' }
+        }
+
+        return { success: true, rewardId: payload.rewardId };
+    } catch (e) {
+        return { success: false, error: 'Error del servidor' };
     }
 }

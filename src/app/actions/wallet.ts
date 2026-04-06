@@ -3,6 +3,7 @@
 import { createClient } from '@/utils/supabase/server'
 import { createAdminClient } from '@/utils/supabase/admin'
 import { sanitizeError } from '@/lib/error-sanitizer'
+import { redis } from '@/lib/redis'
 
 /**
  * Obtiene las wallets del usuario autenticado.
@@ -195,5 +196,56 @@ export async function getUserLedger() {
 
     } catch (e: any) {
         return { success: false, error: sanitizeError(e, 'wallet') }
+    }
+}
+
+/**
+ * Genera un código de seguridad seguro de 6 caracteres almacenado en Redis (TTL 60s).
+ * Enlaza el teléfono del usuario y el premio específico con el token para validación en el POS.
+ */
+export async function generateSecurityToken(orgId: string, rewardId: string) {
+    const supabase = await createClient()
+
+    try {
+        const { data: { user }, error: authError } = await supabase.auth.getUser()
+        if (authError || !user) throw new Error('No autorizado')
+
+        // Fetch User's Phone from DB
+        const { data: userData } = await supabase
+            .from('users')
+            .select('phone')
+            .or(`id.eq.${user.id},auth_user_id.eq.${user.id}`)
+            .single()
+
+        if (!userData || !userData.phone) {
+            throw new Error('Número de teléfono no encontrado en el perfil.')
+        }
+
+        const phone = userData.phone
+
+        // Random 6 Char alphanumeric Code
+        const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        let code = "";
+        const array = new Uint8Array(6);
+        crypto.getRandomValues(array);
+        for (let i = 0; i < 6; i++) {
+            code += chars[array[i] % chars.length];
+        }
+
+        // Store in Redis with TTL 60 seconds
+        if (redis) {
+            const numericPhone = phone.replace(/\D/g, ''); // Fix para alinear cruce de datos pos vs client
+            // El Token ahora guarda el payload json con el UUID de la organización
+            const cacheKey = `b2b_token:${orgId}:${numericPhone}`
+            const payload = JSON.stringify({ code, rewardId })
+            await redis.setex(cacheKey, 60, payload)
+        } else {
+            console.warn('CRITICAL: Redis is not configured. Tokens are running in MOCK mode.')
+        }
+
+        return { success: true, token: code }
+
+    } catch (e: any) {
+        return { success: false, error: sanitizeError(e, 'wallet_token') }
     }
 }

@@ -275,9 +275,15 @@ export async function executeIdentityFusion(claimToken: string) {
                 .update({ user_id: existingAuthUser.id })
                 .eq('user_id', ghostUser.id)
 
+            // Seguridad Bancaria: Reemplazo de Hard Delete por Soft Merge
+            // Esto evita romper logs históricos (Cascade Delete) de transacciones o seguridad
             await supabaseAdmin
                 .from('users')
-                .delete()
+                .update({ 
+                    is_registered: false,
+                    phone: null, // Liberamos el teléfono
+                    updated_at: new Date().toISOString()
+                })
                 .eq('id', ghostUser.id)
 
             if (!existingAuthUser.phone) {
@@ -351,15 +357,13 @@ export async function executeIdentityFusion(claimToken: string) {
                         org_id: org_id,
                         type: 'EARN',
                         amount: bonusAmount,
-                        balance_snapshot: newBalance,
+                        balance_snapshot: 0, // Dummy para bypass constraint NOT NULL.
                         created_by_member_id: orgMember?.id || null,
                         description: 'Bono de bienvenida por verificación de identidad'
                     })
 
-                await supabaseAdmin
-                    .from('wallets')
-                    .update({ balance: newBalance })
-                    .eq('id', wallet.id)
+                // ❌ EL UPDATE MANUAL A WALLETS FUE ELIMINADO PARA PREVENIR DOBLE DEPÓSITO 
+                // Y EVITAR CONDICIONES DE CARRERA CON EL TRIGGER DE POSTGRESQL (sp_update_wallet_balance)
                 
                 bonusAwarded = true;
             }

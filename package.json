@@ -19,6 +19,7 @@
     "crypto-js": "^4.2.0",
     "date-fns": "^4.1.0",
     "framer-motion": "^12.35.1",
+    "html5-qrcode": "^2.3.8",
     "jose": "^6.2.1",
     "jsonwebtoken": "^9.0.3",
     "lucide-react": "^0.576.0",

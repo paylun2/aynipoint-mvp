@@ -14,11 +14,6 @@ import RedemptionSlider from "@/components/b2c/RedemptionSlider";
 import WelcomeBonus from "@/components/b2c/WelcomeBonus";
 
 export default function WalletPage() {
-    const [activeToken, setActiveToken] = useState<string | null>(null);
-    const [timeLeft, setTimeLeft] = useState(60);
-    const [copied, setCopied] = useState(false);
-    const [totpCode, setTotpCode] = useState("");
-
     // Auth State
     const supabase = createClient();
     const [user, setUser] = useState<User | null>(null);
@@ -40,7 +35,7 @@ export default function WalletPage() {
     const [activeFilter, setActiveFilter] = useState<string>('ALL');
 
     // FASE 7: Redemption Slider & Welcome Bonus
-    const [redemptionTarget, setRedemptionTarget] = useState<{ name: string; slug: string; points: number } | null>(null);
+    const [redemptionTarget, setRedemptionTarget] = useState<{ name: string; slug: string; points: number; rewardId?: string; rewardTitle?: string } | null>(null);
     const [showWelcomeBonus, setShowWelcomeBonus] = useState(false);
     const [welcomeBonusStore, setWelcomeBonusStore] = useState<{ name: string; points: number }>({ name: '', points: 0 });
 
@@ -72,18 +67,6 @@ export default function WalletPage() {
 
     // Sumar todos los puntos de todas las tiendas en las que el usuario tiene saldo
     const totalPoints = activeStores.reduce((acc, store) => acc + store.points, 0);
-
-    // Generate a cryptographically random 4-character TOTP code
-    const generateTotp = useCallback(() => {
-        const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-        let code = "";
-        const array = new Uint8Array(4);
-        crypto.getRandomValues(array);
-        for (let i = 0; i < 4; i++) {
-            code += chars[array[i] % chars.length];
-        }
-        return code;
-    }, []);
 
     useEffect(() => {
         const fetchUserAndWallets = async () => {
@@ -133,31 +116,6 @@ export default function WalletPage() {
         fetchUserAndWallets();
     }, [supabase]);
 
-    // Timer logic para el TOTP Modal
-    useEffect(() => {
-        if (!activeToken) return;
-        setTotpCode(generateTotp());
-        setTimeLeft(60);
-
-        const timer = setInterval(() => {
-            setTimeLeft((prev) => {
-                if (prev <= 1) {
-                    setTotpCode(generateTotp());
-                    return 60;
-                }
-                return prev - 1;
-            });
-        }, 1000);
-
-        return () => clearInterval(timer);
-    }, [activeToken, generateTotp]);
-
-    const handleCopy = () => {
-        navigator.clipboard.writeText(totpCode);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 2000);
-    };
-
     // Open discounts browser (informational only)
     const handleViewDiscounts = async (store: any) => {
         setDiscountsBrowser({ storeId: store.id, storeName: store.name, storePoints: store.points });
@@ -171,9 +129,13 @@ export default function WalletPage() {
         setLoadingDiscounts(false);
     };
 
-    // Generate TOTP directly (no reward selection needed)
-    const handleCanjear = (storeName: string) => {
-        setActiveToken(storeName);
+    // Generate TOTP directly
+    const handleCanjear = (store: any) => {
+        setRedemptionTarget({
+            name: store.name,
+            slug: store.id, // Usamos orgId para que el SecurityTokenGenerator pueda firmar en Redis
+            points: store.points,
+        });
     };
 
     const userName = user?.user_metadata?.full_name || user?.email?.split('@')[0] || "Usuario";
@@ -299,7 +261,7 @@ export default function WalletPage() {
                             points={store.points}
                             logoUrl={store.logo_url}
                             brandColor={store.brand_color}
-                            onActionClick={() => handleCanjear(store.slug)}
+                            onActionClick={() => handleCanjear(store)}
                             onCardClick={() => handleViewDiscounts(store)}
                         />
                     ))}
@@ -417,11 +379,17 @@ export default function WalletPage() {
                                         {affordable.map((discount, i) => (
                                             <button
                                                 key={discount.id}
-                                                className={`group flex items-center gap-4 bg-white/5 p-4 rounded-2xl text-left w-full transition-all active:scale-[0.98] ${
-                                                    i === 0 
-                                                        ? 'border border-orange-500/80 shadow-[0_4px_20px_rgba(249,115,22,0.15)] bg-orange-500/5' 
-                                                        : 'border border-white/5 hover:border-orange-500/50 hover:bg-white/10'
-                                                }`}
+                                                onClick={() => {
+                                                    setDiscountsBrowser(null);
+                                                    setRedemptionTarget({
+                                                        name: discountsBrowser.storeName,
+                                                        slug: discountsBrowser.storeId,
+                                                        points: discountsBrowser.storePoints,
+                                                        rewardId: discount.id,
+                                                        rewardTitle: discount.description
+                                                    });
+                                                }}
+                                                className={`group flex items-center gap-4 bg-white/5 p-4 rounded-2xl text-left w-full transition-all active:scale-[0.98] cursor-pointer hover:border-orange-500/50 hover:bg-white/10 border border-white/5`}
                                             >
                                                 <div className="w-14 h-14 rounded-xl shrink-0 flex items-center justify-center bg-gradient-to-b from-orange-500/20 to-orange-500/5 border border-orange-500/20 shadow-inner">
                                                     {i === 0 ? <Sparkles className="w-6 h-6 text-orange-400" /> : <Percent className="w-6 h-6 text-orange-400/80" />}
@@ -435,8 +403,8 @@ export default function WalletPage() {
                                                         <span className="text-orange-400 text-sm font-black drop-shadow-md tracking-wide">{discount.points_cost.toLocaleString()} PTS</span>
                                                     </div>
                                                 </div>
-                                                <div className="shrink-0 w-8 h-8 rounded-full bg-white/5 border border-white/10 text-white flex items-center justify-center group-hover:bg-orange-500 group-hover:border-orange-500 group-hover:text-black transition-all">
-                                                    <CheckCircle2 className="w-4 h-4" />
+                                                <div className="shrink-0 text-orange-400 font-bold text-[10px] uppercase tracking-wider px-3 py-1.5 rounded-full border border-orange-500/30 group-hover:bg-orange-500 group-hover:text-black transition-all">
+                                                    Canjear
                                                 </div>
                                             </button>
                                         ))}
@@ -451,7 +419,7 @@ export default function WalletPage() {
                                         )}
 
                                         {/* Locked rewards */}
-                                        {locked.map(discount => (
+                                        {locked.map((discount: any) => (
                                             <div 
                                                 key={discount.id}
                                                 className="flex items-center gap-4 bg-transparent p-4 rounded-2xl border border-white/5 opacity-50 grayscale-[80%]"
@@ -474,111 +442,17 @@ export default function WalletPage() {
                                 );
                             })()}
                         </div>
-
-                        {/* Fixed Bottom Action Button */}
-                        <div className="absolute bottom-0 inset-x-0 p-6 bg-gradient-to-t from-[#050505] via-[#050505] to-transparent pt-16 z-20">
-                            <button
-                                onClick={() => {
-                                    setDiscountsBrowser(null);
-                                    setRedemptionTarget({
-                                        name: discountsBrowser.storeName,
-                                        slug: discountsBrowser.storeId,
-                                        points: discountsBrowser.storePoints,
-                                    });
-                                }}
-                                className="w-full bg-orange-500 hover:bg-orange-400 text-black font-black py-4 rounded-2xl shadow-[0_0_40px_rgba(249,115,22,0.4)] transition-all flex items-center justify-center gap-2 active:scale-[0.98] uppercase tracking-widest text-xs"
-                            >
-                                Autorizar Canje
-                            </button>
-                        </div>
                     </div>
                 </div>
             )}
 
-            {/* ═══════ TOTP CODE MODAL (Identity verification only) ═══════ */}
-            {activeToken && (
-                <div className="fixed inset-0 bg-[#000000]/95 backdrop-blur-2xl z-50 flex flex-col items-center justify-center p-6 sm:p-8 text-white animate-in zoom-in-95 fade-in duration-300">
-                    
-                    {/* Ambient Modal Glow */}
-                    <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[80vw] h-[80vw] max-w-[500px] max-h-[500px] bg-sky-500/10 rounded-full blur-[100px] pointer-events-none mix-blend-screen" />
-
-                    <button 
-                        onClick={() => setActiveToken(null)} 
-                        className="absolute top-8 right-8 text-white/50 hover:text-white transition-colors p-3 bg-white/5 border border-white/10 rounded-full hover:bg-white/10 z-20"
-                    >
-                        <X className="w-6 h-6" />
-                    </button>
-
-                    <div className="text-center mb-8 w-full max-w-sm relative z-10">
-                        <div className="inline-flex items-center justify-center gap-2 px-4 py-1.5 rounded-full bg-sky-500/10 border border-sky-500/20 text-sky-400 uppercase tracking-[0.3em] font-black text-[10px] mb-6">
-                            <ShieldCheck className="w-3.5 h-3.5" /> Autenticador Seguro
-                        </div>
-                        <h3 className="text-sm font-bold text-white/70 tracking-widest uppercase mb-1">{activeToken}</h3>
-                    </div>
-
-                    {/* Circular Timer Progress (Holographic Ultra-Premium) */}
-                    <div className="relative w-80 h-80 flex items-center justify-center mb-10 z-10">
-                        {/* Outer rotating dashed ring */}
-                        <div className="absolute inset-2 border-[2px] border-dashed border-sky-500/20 rounded-full animate-[spin_20s_linear_infinite]" />
-                        
-                        <svg className="absolute inset-0 w-full h-full -rotate-90">
-                            <defs>
-                                <linearGradient id="skyGlow" x1="0%" y1="0%" x2="100%" y2="100%">
-                                    <stop offset="0%" stopColor="#0ea5e9" />
-                                    <stop offset="50%" stopColor="#38bdf8" />
-                                    <stop offset="100%" stopColor="#0284c7" />
-                                </linearGradient>
-                                <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
-                                    <feGaussianBlur stdDeviation="6" result="blur" />
-                                    <feComposite in="SourceGraphic" in2="blur" operator="over" />
-                                </filter>
-                            </defs>
-                            <circle cx="50%" cy="50%" fill="transparent" r="46%" stroke="rgba(255,255,255,0.03)" strokeWidth="6"></circle>
-                            <circle 
-                                cx="50%" cy="50%" fill="transparent" r="46%" 
-                                stroke="url(#skyGlow)" 
-                                strokeDasharray="290" 
-                                strokeDashoffset={290 - (290 * timeLeft) / 60} 
-                                strokeLinecap="round" 
-                                strokeWidth="6" 
-                                filter="url(#glow)"
-                                className="transition-all duration-1000 ease-linear drop-shadow-[0_0_10px_rgba(14,165,233,0.5)]"
-                            ></circle>
-                        </svg>
-                        
-                        {/* Inner glowing core */}
-                        <div className="flex flex-col items-center z-10 bg-[#050505] w-[230px] h-[230px] rounded-full justify-center border border-white/10 shadow-[inset_0_0_60px_rgba(14,165,233,0.15),0_10px_40px_rgba(0,0,0,0.8)] relative overflow-hidden">
-                            <div className="absolute inset-0 bg-gradient-to-b from-white/5 to-transparent pointer-events-none" />
-                            <span className="font-mono text-6xl font-black tracking-widest text-transparent bg-clip-text bg-gradient-to-b from-white to-white/70 drop-shadow-lg relative z-10">
-                                {totpCode}
-                            </span>
-                            <span className={`mt-3 font-mono text-lg font-black tracking-widest relative z-10 ${timeLeft < 10 ? 'text-rose-400 animate-pulse drop-shadow-[0_0_8px_rgba(244,63,94,0.5)]' : 'text-sky-400 drop-shadow-[0_0_8px_rgba(14,165,233,0.3)]'}`}>
-                                0:{timeLeft.toString().padStart(2, '0')}s
-                            </span>
-                        </div>
-                    </div>
-
-                    <div className="text-center max-w-[280px] mb-10 relative z-10">
-                        <p className="text-white/50 text-xs leading-relaxed font-medium">
-                            Dicta este token numérico al cajero para completar tu operación de canje.
-                        </p>
-                    </div>
-
-                    <div className="flex flex-col sm:flex-row gap-4 w-full max-w-sm relative z-10">
-                        <button onClick={handleCopy} className="flex-1 flex items-center justify-center gap-3 bg-white/5 hover:bg-white/10 border border-white/10 py-4 px-6 rounded-2xl font-bold text-sm transition-all text-white backdrop-blur-md">
-                            {copied ? <CheckCircle2 className="w-5 h-5 text-sky-400" /> : <Copy className="w-5 h-5 text-white/70" />}
-                            {copied ? 'Copiado al portapapeles' : 'Copiar Token'}
-                        </button>
-                    </div>
-                </div>
-            )}
-
-            {/* FASE 7: Redemption Slider */}
+            {/* FASE 8: Security PIN Generator */}
             {redemptionTarget && (
                 <RedemptionSlider
                     storeName={redemptionTarget.name}
                     storeSlug={redemptionTarget.slug}
-                    maxPoints={redemptionTarget.points}
+                    rewardId={redemptionTarget.rewardId}
+                    rewardTitle={redemptionTarget.rewardTitle}
                     onClose={() => setRedemptionTarget(null)}
                 />
             )}

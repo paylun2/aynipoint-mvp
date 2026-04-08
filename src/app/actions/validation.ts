@@ -310,8 +310,8 @@ export async function executeIdentityFusion(claimToken: string) {
             }
         }
 
-        // 6. Fusión estándar: Ghost → Soberano
-        const { error: updateError } = await supabaseAdmin
+        // 6. Fusión estándar: Ghost → Soberano (Protección Anti-Replay Attack)
+        const { data: fusedUser, error: updateError } = await supabaseAdmin
             .from('users')
             .update({
                 auth_user_id: user.id,
@@ -323,9 +323,12 @@ export async function executeIdentityFusion(claimToken: string) {
                 updated_at: new Date().toISOString()
             })
             .eq('id', ghostUser.id)
+            .eq('is_registered', false) // 🛡️ CONDICIÓN ATÓMICA: Evita transacciones concurrentes
+            .select()
+            .single()
 
-        if (updateError) {
-            throw new Error('Error en la operación de fusión de identidad.')
+        if (updateError || !fusedUser) {
+            throw new Error('Error de concurrencia: Esta identidad ya está siendo procesada o fue reclamada.')
         }
 
         // 7. Bono de bienvenida: +100 puntos atribuidos al comercio validador (Si aplica)

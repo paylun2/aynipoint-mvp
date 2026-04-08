@@ -669,24 +669,40 @@ USING (org_id::text = current_setting('app.current_org_id', TRUE));
 -- =====================================================================
 CREATE OR REPLACE FUNCTION sp_update_wallet_balance()
 RETURNS TRIGGER AS $$
+DECLARE
+    current_balance BIGINT;
 BEGIN
+    -- Bloqueo pesimista (Row-level lock): Evita que 2 cajeros cobren al mismo tiempo
+    SELECT balance INTO current_balance 
+    FROM public.wallets 
+    WHERE id = NEW.wallet_id 
+    FOR UPDATE;
+
+    -- Calculamos la verdad absoluta del Ledger
+    NEW.balance_snapshot := current_balance + NEW.amount;
+
+    -- Actualizamos la Wallet
     UPDATE public.wallets
     SET 
-        balance = balance + NEW.amount,
+        balance = NEW.balance_snapshot,
         last_transaction_at = NOW(),
         lifetime_earned = CASE 
             WHEN NEW.amount > 0 THEN lifetime_earned + NEW.amount 
             ELSE lifetime_earned 
         END
     WHERE id = NEW.wallet_id;
+
+    -- Al retornar NEW en un trigger BEFORE, PostgreSQL guarda el balance_snapshot real
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
 ALTER FUNCTION public.sp_update_wallet_balance() SET search_path = public;
 
+DROP TRIGGER IF EXISTS trg_update_balance ON public.ledger_transactions;
+
 CREATE TRIGGER trg_update_balance
-AFTER INSERT ON public.ledger_transactions
+BEFORE INSERT ON public.ledger_transactions
 FOR EACH ROW
 EXECUTE PROCEDURE sp_update_wallet_balance();
 
@@ -2833,35 +2849,7 @@ ON CONFLICT (id) DO NOTHING;
 -- Ejecutar en el SQL Editor de Supabase.
 -- ============================================================
 
--- Función RPC para actualización atómica de balance
-CREATE OR REPLACE FUNCTION atomic_balance_update(
-    p_wallet_id UUID,
-    p_delta INTEGER
-)
-RETURNS VOID
-LANGUAGE plpgsql
-SECURITY DEFINER  -- Ejecuta con privilegios del owner (bypasa RLS)
-SET search_path = public
-AS $$
-BEGIN
-    UPDATE wallets
-    SET balance = balance + p_delta,
-        updated_at = NOW()
-    WHERE id = p_wallet_id;
 
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Wallet % no encontrada', p_wallet_id;
-    END IF;
-END;
-$$;
-
--- Solo el service_role puede invocar esta función (seguridad bancaria)
-REVOKE ALL ON FUNCTION atomic_balance_update(UUID, INTEGER) FROM PUBLIC;
-REVOKE ALL ON FUNCTION atomic_balance_update(UUID, INTEGER) FROM anon;
-REVOKE ALL ON FUNCTION atomic_balance_update(UUID, INTEGER) FROM authenticated;
-
--- Comentario de auditoría
-COMMENT ON FUNCTION atomic_balance_update IS 'C-05 Security Fix: Atomic wallet balance update to prevent race conditions in concurrent refunds. SECURITY DEFINER, restricted to service_role only.';
 
 
 
